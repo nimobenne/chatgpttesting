@@ -1,42 +1,40 @@
-# Claude Agents Monitor (TUI)
+# Claude Agent Monitor TUI
 
-A live terminal dashboard that monitors active Claude Code agents by scanning Claude debug logs and matching them to currently running Claude processes.
+A live terminal dashboard that monitors active Claude Code agents by:
 
-## Features
+- Scanning Claude debug logs (including `/.cladude.debug` typo variants)
+- Extracting session IDs, project paths, state, and active tool
+- Correlating sessions to running `claude` processes
+- Displaying runtime and status in a live updating Rich TUI
 
-- No external Python dependencies (uses only the standard library + terminal curses support).
-- Auto-discovers common Claude debug directories:
-  - `/.cladude.debug`
-  - `/.claude.debug`
-  - `~/.cladude.debug`
-  - `~/.claude.debug`
-  - `~/.config/claude`
-- Displays:
-  - Session ID
-  - PID
-  - Project/workspace
-  - Current state (`typing`, `reading`, `idle`, `sleep`, `waiting for input`)
-  - Active tool (if found)
-  - Runtime
-  - Running/log-only status
-- Live-updating terminal UI (`q` to quit).
+## Requirements
+
+- Python 3.9+
+- `rich`
+
+Install dependency:
+
+```bash
+pip install rich
+```
 
 ## Run
 
 ```bash
-python3 claude_agents_dashboard.py
+python claude_agents_dashboard.py
 ```
 
-Custom scan paths:
+Optional flags:
 
 ```bash
-python3 claude_agents_dashboard.py --scan-path ~/.claude.debug --scan-path /tmp/claude-logs
+python claude_agents_dashboard.py --refresh 0.5 --scan-root ~/.claude --scan-root /.cladude.debug
 ```
 
-Adjust refresh interval:
+Columns shown:
 
-```bash
-python3 claude_agents_dashboard.py --refresh 0.5
-```
-
-Stop with `q` or `Ctrl+C`.
+- Session ID
+- Project
+- State (`typing`, `reading`, `idle`, `sleep`, `waiting`, `unknown`)
+- Tool
+- PID
+- Running time
