@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""Live terminal dashboard for monitoring active Claude Code agents."""
+"""Live terminal dashboard for monitoring active Claude Code agents without external deps."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import os
+import curses
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-
-from rich import box
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-
 
 STATE_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"\btyping\b", re.IGNORECASE), "typing"),
@@ -47,7 +42,6 @@ class AgentSnapshot:
     state: str
     tool: str
     started_at: Optional[float]
-    source_file: str
     is_running: bool
 
     @property
@@ -64,13 +58,8 @@ class AgentSnapshot:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Monitor active Claude Code agents in a live TUI.")
-    parser.add_argument(
-        "--scan-path",
-        action="append",
-        default=[],
-        help="Path to scan for debug logs (can be repeated).",
-    )
-    parser.add_argument("--refresh", type=float, default=1.0, help="Refresh interval in seconds (default: 1.0).")
+    parser.add_argument("--scan-path", action="append", default=[], help="Path to scan for debug logs.")
+    parser.add_argument("--refresh", type=float, default=1.0, help="Refresh interval in seconds.")
     parser.add_argument("--max-lines", type=int, default=2000, help="Max tail lines to parse per log file.")
     return parser.parse_args()
 
@@ -100,30 +89,22 @@ def gather_log_files(scan_paths: Iterable[Path]) -> List[Path]:
 
 def tail_lines(path: Path, max_lines: int) -> List[str]:
     try:
-        with path.open("rb") as f:
-            data = f.read()
-    except (OSError, UnicodeDecodeError):
+        data = path.read_bytes()
+    except OSError:
         return []
-
-    try:
-        text = data.decode("utf-8", errors="replace")
-    except Exception:
-        return []
-
+    text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()
-    if len(lines) <= max_lines:
-        return lines
-    return lines[-max_lines:]
+    return lines[-max_lines:] if len(lines) > max_lines else lines
 
 
 def first_match(pattern: re.Pattern[str], lines: Iterable[str], reverse: bool = False) -> Optional[str]:
     sequence = list(lines)
     if reverse:
-        sequence = list(reversed(sequence))
+        sequence.reverse()
     for line in sequence:
-        m = pattern.search(line)
-        if m:
-            return m.group(1).strip()
+        match = pattern.search(line)
+        if match:
+            return match.group(1).strip()
     return None
 
 
@@ -149,8 +130,7 @@ def detect_start_timestamp(lines: Iterable[str]) -> Optional[float]:
             if raw.isdigit() and len(raw) == 10:
                 return float(raw)
             try:
-                normalized = raw.replace("Z", "+00:00")
-                return dt.datetime.fromisoformat(normalized).timestamp()
+                return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
             except ValueError:
                 continue
     return None
@@ -158,35 +138,27 @@ def detect_start_timestamp(lines: Iterable[str]) -> Optional[float]:
 
 def running_claude_pids() -> Dict[int, str]:
     try:
-        proc = subprocess.run(
-            ["ps", "-eo", "pid=,args="],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        proc = subprocess.run(["ps", "-eo", "pid=,args="], check=True, text=True, capture_output=True)
     except subprocess.SubprocessError:
         return {}
-
-    result: Dict[int, str] = {}
-    for raw in proc.stdout.splitlines():
-        line = raw.strip()
-        if not line:
+    pids: Dict[int, str] = {}
+    for row in proc.stdout.splitlines():
+        row = row.strip()
+        if not row:
             continue
-        parts = line.split(maxsplit=1)
-        if not parts:
-            continue
+        pid_part, *rest = row.split(maxsplit=1)
         try:
-            pid = int(parts[0])
+            pid = int(pid_part)
         except ValueError:
             continue
-        args = parts[1] if len(parts) > 1 else ""
+        args = rest[0] if rest else ""
         if "claude" in args.lower():
-            result[pid] = args
-    return result
+            pids[pid] = args
+    return pids
 
 
 def parse_agent_from_log(path: Path, max_lines: int, live_pids: Dict[int, str]) -> Optional[AgentSnapshot]:
-    lines = tail_lines(path, max_lines=max_lines)
+    lines = tail_lines(path, max_lines)
     if not lines:
         return None
 
@@ -197,15 +169,15 @@ def parse_agent_from_log(path: Path, max_lines: int, live_pids: Dict[int, str]) 
     project = first_match(PROJECT_PATTERN, lines, reverse=True)
     if not project and pid and pid in live_pids:
         cmd = live_pids[pid]
-        m = re.search(r"(?:--cwd|--project)\s+([^\s]+)", cmd)
-        project = m.group(1) if m else "unknown"
+        match = re.search(r"(?:--cwd|--project)\s+([^\s]+)", cmd)
+        project = match.group(1) if match else "unknown"
     project = project or "unknown"
 
     state = detect_state(lines)
     tool = first_match(TOOL_PATTERN, lines, reverse=True) or "-"
     started_at = detect_start_timestamp(lines)
-    is_running = bool(pid and pid in live_pids)
 
+    is_running = bool(pid and pid in live_pids)
     if not pid:
         stem_digits = re.search(r"(\d{3,})", path.stem)
         if stem_digits:
@@ -214,80 +186,117 @@ def parse_agent_from_log(path: Path, max_lines: int, live_pids: Dict[int, str]) 
                 pid = possible_pid
                 is_running = True
 
-    return AgentSnapshot(
-        session_id=session_id,
-        pid=pid,
-        project=project,
-        state=state,
-        tool=tool,
-        started_at=started_at,
-        source_file=str(path),
-        is_running=is_running,
-    )
+    return AgentSnapshot(session_id, pid, project, state, tool, started_at, is_running)
 
 
 def collect_agents(scan_paths: List[Path], max_lines: int) -> List[AgentSnapshot]:
     live_pids = running_claude_pids()
-    logs = gather_log_files(scan_paths)
-    snapshots: List[AgentSnapshot] = []
-    for log in logs:
-        snap = parse_agent_from_log(log, max_lines=max_lines, live_pids=live_pids)
+    snapshots: Dict[str, AgentSnapshot] = {}
+    for log in gather_log_files(scan_paths):
+        snap = parse_agent_from_log(log, max_lines, live_pids)
         if snap and (snap.is_running or snap.state != "unknown"):
-            snapshots.append(snap)
-
-    unique: Dict[str, AgentSnapshot] = {}
-    for snap in snapshots:
-        unique[snap.session_id] = snap
-    return sorted(unique.values(), key=lambda s: (not s.is_running, s.session_id))
+            snapshots[snap.session_id] = snap
+    return sorted(snapshots.values(), key=lambda s: (not s.is_running, s.session_id))
 
 
-def build_table(snapshots: List[AgentSnapshot], scan_paths: List[Path]) -> Table:
-    table = Table(title="Claude Code Agents Monitor", box=box.SIMPLE_HEAVY)
-    table.add_column("Session ID", overflow="fold")
-    table.add_column("PID", justify="right")
-    table.add_column("Project", overflow="fold")
-    table.add_column("State")
-    table.add_column("Tool")
-    table.add_column("Runtime", justify="right")
-    table.add_column("Status")
+def fit(value: str, width: int) -> str:
+    if width <= 1:
+        return ""
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 1] + "…"
 
+
+def draw_dashboard(stdscr: "curses._CursesWindow", scan_paths: List[Path], refresh: float, max_lines: int) -> None:
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+
+    headers = ["Session ID", "PID", "Project", "State", "Tool", "Runtime", "Status"]
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        snapshots = collect_agents(scan_paths, max_lines)
+
+        stdscr.addstr(0, 0, fit("Claude Code Agents Monitor (q to quit)", w - 1))
+        stdscr.addstr(1, 0, fit(f"Scanning: {', '.join(str(p) for p in scan_paths)}", w - 1))
+
+        widths = [24, 7, 24, 18, 18, 10, 10]
+        total = sum(widths) + len(widths) - 1
+        if total > w - 1:
+            scale = (w - 1 - (len(widths) - 1)) / max(sum(widths), 1)
+            widths = [max(4, int(col * scale)) for col in widths]
+
+        y = 3
+        x = 0
+        for idx, head in enumerate(headers):
+            stdscr.addstr(y, x, fit(head, widths[idx]))
+            x += widths[idx] + 1
+
+        y += 1
+        stdscr.hline(y, 0, ord("-"), min(w - 1, sum(widths) + len(widths) - 1))
+        y += 1
+
+        if not snapshots:
+            stdscr.addstr(y, 0, fit("No agents detected", w - 1))
+        else:
+            for snap in snapshots:
+                if y >= h - 1:
+                    break
+                row = [
+                    snap.session_id,
+                    str(snap.pid or "-"),
+                    snap.project,
+                    snap.state,
+                    snap.tool,
+                    snap.runtime,
+                    "running" if snap.is_running else "log-only",
+                ]
+                x = 0
+                for idx, col in enumerate(row):
+                    stdscr.addstr(y, x, fit(col, widths[idx]))
+                    x += widths[idx] + 1
+                y += 1
+
+        stdscr.refresh()
+
+        for _ in range(max(1, int(refresh * 10))):
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                return
+            time.sleep(0.1)
+
+
+
+
+def print_snapshot(scan_paths: List[Path], max_lines: int) -> None:
+    snapshots = collect_agents(scan_paths, max_lines)
+    print("Claude Code Agents Monitor")
+    print(f"Scanning: {', '.join(str(p) for p in scan_paths)}")
     if not snapshots:
-        table.add_row("-", "-", "-", "-", "-", "-", "No agents detected")
-    else:
-        for snap in snapshots:
-            status = "🟢 running" if snap.is_running else "🟡 log-only"
-            table.add_row(
-                snap.session_id,
-                str(snap.pid or "-"),
-                snap.project,
-                snap.state,
-                snap.tool,
-                snap.runtime,
-                status,
-            )
-
-    scan_info = ", ".join(str(p) for p in scan_paths) if scan_paths else "(none found)"
-    table.caption = f"Scanning: {scan_info}"
-    return table
-
+        print("No agents detected")
+        return
+    for snap in snapshots:
+        print(
+            f"{snap.session_id} | pid={snap.pid or '-'} | project={snap.project} | "
+            f"state={snap.state} | tool={snap.tool} | runtime={snap.runtime} | "
+            f"status={'running' if snap.is_running else 'log-only'}"
+        )
 
 def main() -> int:
     args = parse_args()
-    paths = [Path(p).expanduser() for p in args.scan_path] if args.scan_path else default_scan_paths()
-
-    console = Console()
-    if not paths:
-        console.print("[yellow]No debug paths found. Use --scan-path to provide one or more log directories.[/yellow]")
+    scan_paths = [Path(p).expanduser() for p in args.scan_path] if args.scan_path else default_scan_paths()
+    if not scan_paths:
+        print("No debug paths found. Use --scan-path to provide log directories.")
         return 1
-
-    with Live(build_table([], paths), console=console, refresh_per_second=max(1, int(1 / max(args.refresh, 0.1)))) as live:
-        try:
-            while True:
-                snapshots = collect_agents(paths, max_lines=args.max_lines)
-                live.update(build_table(snapshots, paths))
-                time.sleep(args.refresh)
-        except KeyboardInterrupt:
-            return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print_snapshot(scan_paths, args.max_lines)
+        return 0
+    curses.wrapper(draw_dashboard, scan_paths, max(args.refresh, 0.2), args.max_lines)
+    return 0
 
 
 if __name__ == "__main__":

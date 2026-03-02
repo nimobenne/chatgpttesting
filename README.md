@@ -4,6 +4,7 @@ A live terminal dashboard that monitors active Claude Code agents by scanning Cl
 
 ## Features
 
+- No external Python dependencies (uses only the standard library + terminal curses support).
 - Auto-discovers common Claude debug directories:
   - `/.cladude.debug`
   - `/.claude.debug`
@@ -18,13 +19,7 @@ A live terminal dashboard that monitors active Claude Code agents by scanning Cl
   - Active tool (if found)
   - Runtime
   - Running/log-only status
-- Live-updating Rich TUI.
-
-## Install
-
-```bash
-python3 -m pip install rich
-```
+- Live-updating terminal UI (`q` to quit).
 
 ## Run
 
@@ -44,4 +39,4 @@ Adjust refresh interval:
 python3 claude_agents_dashboard.py --refresh 0.5
 ```
 
-Stop with `Ctrl+C`.
+Stop with `q` or `Ctrl+C`.
