@@ -1,643 +1,566 @@
 #!/usr/bin/env python3
-<<<<<<< ours
-<<<<<<< ours
-"""Live terminal dashboard for active Claude Code agents.
+"""Live terminal dashboard for Codex/Claude agent activity.
 
-Scans Claude debug logs, correlates sessions with running Claude-related processes,
-and renders a live updating Rich TUI.
+This dashboard scans local debug logs and correlates them with running processes.
+It highlights agent activity states like typing, thinking, idle, and waiting,
+and shows timing/status details in a clean terminal table.
 """
-=======
-"""Live terminal dashboard for monitoring active Claude Code agents without external deps."""
->>>>>>> theirs
-=======
-"""Live terminal dashboard for monitoring active Claude Code agents without external deps."""
->>>>>>> theirs
 
 from __future__ import annotations
 
 import argparse
-<<<<<<< ours
-<<<<<<< ours
+import datetime as dt
 import json
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from rich import box
-from rich.console import Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+LOG_EXTENSIONS = {".log", ".txt", ".jsonl", ".ndjson"}
+LOG_NAME_HINTS = ("codex", "claude", "agent", "debug")
 
-STATE_ORDER = ["typing", "reading", "waiting", "idle", "sleep", "unknown"]
-STATE_COLORS = {
-    "typing": "green",
-    "reading": "cyan",
-    "waiting": "yellow",
-    "idle": "magenta",
-    "sleep": "dim",
-    "unknown": "white",
-}
+STATE_RULES = [
+    ("typing", re.compile(r"\b(typing|stream(ing)?|generat(ing|ed)?|respond(ing|ed)?)\b", re.IGNORECASE)),
+    ("thinking", re.compile(r"\b(thinking|analy(s|z)ing|reason(ing|ed)?|planning|reflect(ing|ed)?)\b", re.IGNORECASE)),
+    ("reading", re.compile(r"\b(reading|parsing|indexing|inspect(ing|ed)?)\b", re.IGNORECASE)),
+    ("waiting", re.compile(r"\b(wait(ing)?|blocked|await(ing)?\s+input|need\s+input)\b", re.IGNORECASE)),
+    ("idle", re.compile(r"\b(idle|ready|complete(d)?|done)\b", re.IGNORECASE)),
+    ("sleep", re.compile(r"\b(sleep(ing)?|paused|backoff|throttl(ed|ing)?)\b", re.IGNORECASE)),
+]
 
-STATE_PATTERNS = {
-    "typing": ["typing", "stream", "generating", "responding"],
-    "reading": ["reading", "analyzing", "parse", "indexing"],
-    "waiting": ["wait", "input", "prompt", "blocked"],
-    "idle": ["idle", "ready", "done", "complete"],
-    "sleep": ["sleep", "paused", "backoff", "throttle"],
-}
-
-TOOL_REGEX = re.compile(r"\btool\b\s*[:=]\s*([\w.-]+)", re.IGNORECASE)
-SESSION_REGEX = re.compile(r"\b(session(?:_id)?|sid)\b\s*[:=]\s*([\w-]+)", re.IGNORECASE)
-PROJECT_REGEX = re.compile(r"\b(project|cwd|workspace)\b\s*[:=]\s*([^\s,;]+)", re.IGNORECASE)
+SESSION_RE = re.compile(r"\b(?:session(?:_id|\s*id)?|sid)\b\s*[:=]\s*['\"]?([a-zA-Z0-9_.:/\-]+)", re.IGNORECASE)
+PROJECT_RE = re.compile(r"\b(?:project|repo|workspace|cwd|workdir)\b\s*[:=]\s*['\"]?([^'\"\s,;]+)", re.IGNORECASE)
+TOOL_RE = re.compile(r"\b(?:tool|using\s+tool|invoke(?:d)?\s+tool|call(?:ed)?\s+tool)\b\s*[:=]\s*['\"]?([a-zA-Z0-9_.\-/]+)", re.IGNORECASE)
+PID_RE = re.compile(r"\b(?:pid|process(?:_id)?)\b\s*[:=]\s*(\d+)", re.IGNORECASE)
+ISO_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
+UNIX_TS_RE = re.compile(r"\b(\d{10})\b")
 
 
 @dataclass
 class ProcessInfo:
     pid: int
-    etimes: int
+    name: str
     cmd: str
+    created_at: Optional[float] = None
 
 
 @dataclass
 class AgentSession:
     session_id: str
     project: str = "-"
-    state: str = "unknown"
     tool: str = "-"
+    state: str = "unknown"
+    status: str = "unknown"
     pid: Optional[int] = None
-    runtime_seconds: int = 0
-    last_seen: float = field(default_factory=time.time)
-    source_log: str = "-"
-
-
-class LogTailer:
-    def __init__(self, path: Path):
-        self.path = path
-        self.offset = 0
-        self.inode = None
-
-    def read_new_lines(self) -> List[str]:
-        if not self.path.exists():
-            return []
-
-        stat = self.path.stat()
-        if self.inode is None or self.inode != stat.st_ino or stat.st_size < self.offset:
-            self.inode = stat.st_ino
-            self.offset = 0
-
-        lines: List[str] = []
-        with self.path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(self.offset)
-            for line in f:
-                lines.append(line.rstrip("\n"))
-            self.offset = f.tell()
-        return lines
-
-
-class AgentMonitor:
-    def __init__(self, scan_roots: List[Path]):
-        self.scan_roots = scan_roots
-        self.tailers: Dict[Path, LogTailer] = {}
-        self.sessions: Dict[str, AgentSession] = {}
-
-    def discover_logs(self) -> None:
-        candidates: List[Path] = []
-        for root in self.scan_roots:
-            if not root.exists():
-                continue
-            if root.is_file():
-                name = root.name.lower()
-                if ("claude" in name or "cladude" in name) and "debug" in name:
-                    candidates.append(root)
-                continue
-            for pattern in ["*.log", "*.txt", "*.ndjson", "*"]:
-                for p in root.rglob(pattern):
-                    name = p.name.lower()
-                    if p.is_file() and ("claude" in name or "cladude" in name) and "debug" in name:
-                        candidates.append(p)
-
-        for path in candidates:
-            if path not in self.tailers:
-                self.tailers[path] = LogTailer(path)
-
-    def refresh(self) -> None:
-        self.discover_logs()
-        for path, tailer in list(self.tailers.items()):
-            for line in tailer.read_new_lines():
-                self._ingest_line(line, path)
-
-        self._correlate_processes()
-        self._prune_inactive()
-
-    def _ingest_line(self, line: str, source: Path) -> None:
-        payload = self._parse_payload(line)
-        session_id = payload.get("session_id") or self._find_regex(SESSION_REGEX, line, 2)
-        if not session_id:
-            return
-
-        session = self.sessions.setdefault(session_id, AgentSession(session_id=session_id))
-        session.last_seen = time.time()
-        session.source_log = str(source)
-
-        project = payload.get("project") or payload.get("cwd") or self._find_regex(PROJECT_REGEX, line, 2)
-        if project:
-            session.project = project
-
-        tool = payload.get("tool") or self._extract_tool(line)
-        if tool:
-            session.tool = tool
-
-        pid = payload.get("pid")
-        if isinstance(pid, int):
-            session.pid = pid
-
-        state = self._infer_state(payload, line)
-        if state:
-            session.state = state
-
-    @staticmethod
-    def _parse_payload(line: str) -> Dict[str, object]:
-        line = line.strip()
-        if not line:
-            return {}
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                data = json.loads(line)
-                if isinstance(data, dict):
-                    return data
-            except json.JSONDecodeError:
-                return {}
-        return {}
-
-    @staticmethod
-    def _find_regex(pattern: re.Pattern[str], text: str, group: int) -> Optional[str]:
-        match = pattern.search(text)
-        if match:
-            return match.group(group)
-        return None
-
-    @staticmethod
-    def _extract_tool(line: str) -> Optional[str]:
-        match = TOOL_REGEX.search(line)
-        if match:
-            return match.group(1)
-        return None
-
-    @staticmethod
-    def _infer_state(payload: Dict[str, object], line: str) -> str:
-        candidates = [
-            str(payload.get("state", "")),
-            str(payload.get("status", "")),
-            str(payload.get("event", "")),
-            line,
-        ]
-        blob = " ".join(candidates).lower()
-        for state in STATE_ORDER:
-            if state == "unknown":
-                continue
-            for token in STATE_PATTERNS[state]:
-                if token in blob:
-                    return state
-        return "unknown"
-
-    def _correlate_processes(self) -> None:
-        processes = list_claude_processes()
-        by_pid = {proc.pid: proc for proc in processes}
-
-        for session in self.sessions.values():
-            if session.pid and session.pid in by_pid:
-                session.runtime_seconds = by_pid[session.pid].etimes
-                continue
-
-            chosen = self._pick_process_for_session(session, processes)
-            if chosen:
-                session.pid = chosen.pid
-                session.runtime_seconds = chosen.etimes
-
-    @staticmethod
-    def _pick_process_for_session(session: AgentSession, processes: List[ProcessInfo]) -> Optional[ProcessInfo]:
-        sid = session.session_id.lower()
-        project = session.project.lower()
-
-        for proc in processes:
-            cmd = proc.cmd.lower()
-            if sid in cmd:
-                return proc
-        for proc in processes:
-            cmd = proc.cmd.lower()
-            if project and project != "-" and project in cmd:
-                return proc
-        return None
-
-    def _prune_inactive(self, ttl: int = 1800) -> None:
-        now = time.time()
-        to_delete = [sid for sid, sess in self.sessions.items() if now - sess.last_seen > ttl]
-        for sid in to_delete:
-            del self.sessions[sid]
-
-
-def list_claude_processes() -> List[ProcessInfo]:
-    cmd = ["ps", "-eo", "pid=,etimes=,args="]
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    if result.returncode != 0:
-        return []
-
-    procs: List[ProcessInfo] = []
-    for raw in result.stdout.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        parts = line.split(maxsplit=2)
-        if len(parts) != 3:
-            continue
-        pid_s, etimes_s, args = parts
-        if "claude" not in args.lower():
-            continue
-        try:
-            procs.append(ProcessInfo(pid=int(pid_s), etimes=int(etimes_s), cmd=args))
-        except ValueError:
-            continue
-    return procs
-
-
-def format_duration(seconds: int) -> str:
-    h, r = divmod(seconds, 3600)
-    m, s = divmod(r, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
-def build_table(sessions: Iterable[AgentSession]) -> Table:
-    table = Table(title="Claude Agent Monitor", box=box.SIMPLE_HEAVY)
-    table.add_column("Session ID", style="bold")
-    table.add_column("Project")
-    table.add_column("State")
-    table.add_column("Tool")
-    table.add_column("PID", justify="right")
-    table.add_column("Running", justify="right")
-
-    ordered = sorted(sessions, key=lambda s: (STATE_ORDER.index(s.state) if s.state in STATE_ORDER else 99, s.session_id))
-    if not ordered:
-        table.add_row("-", "No active sessions", "-", "-", "-", "-")
-        return table
-
-    for s in ordered:
-        color = STATE_COLORS.get(s.state, "white")
-        state = Text(s.state, style=color)
-        table.add_row(
-            s.session_id,
-            s.project,
-            state,
-            s.tool,
-            str(s.pid) if s.pid else "-",
-            format_duration(s.runtime_seconds),
-        )
-    return table
-
-
-def build_footer(monitor: AgentMonitor) -> Panel:
-    logs = ", ".join(str(path) for path in monitor.tailers.keys()) or "none found"
-    content = Text(f"Watching logs: {logs}")
-    return Panel(content, title="Sources")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live dashboard for Claude code agents")
-    parser.add_argument("--refresh", type=float, default=1.0, help="Refresh interval in seconds")
-    parser.add_argument(
-        "--scan-root",
-        action="append",
-        default=[],
-        help="Directory to scan recursively for Claude debug logs (can be repeated)",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    roots = [Path(p).expanduser() for p in args.scan_root]
-    if not roots:
-        roots = [Path("/.cladude.debug"), Path("~/.claude").expanduser(), Path("/")]
-
-    monitor = AgentMonitor(roots)
-    with Live(refresh_per_second=max(int(1 / max(args.refresh, 0.2)), 1), screen=True) as live:
-        while True:
-            monitor.refresh()
-            group = Group(build_table(monitor.sessions.values()), build_footer(monitor))
-            live.update(group)
-            time.sleep(args.refresh)
-
-
-if __name__ == "__main__":
-    main()
-=======
-=======
->>>>>>> theirs
-import datetime as dt
-import curses
-import re
-import subprocess
-import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
-
-STATE_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\btyping\b", re.IGNORECASE), "typing"),
-    (re.compile(r"\breading\b", re.IGNORECASE), "reading"),
-    (re.compile(r"\bidle\b", re.IGNORECASE), "idle"),
-    (re.compile(r"\bsleep(?:ing)?\b", re.IGNORECASE), "sleep"),
-    (re.compile(r"wait(?:ing)?\s+for\s+input", re.IGNORECASE), "waiting for input"),
-]
-
-TOOL_PATTERN = re.compile(
-    r"(?:tool|using tool|invoke(?:d)? tool|call(?:ed)? tool)\s*[:=]\s*['\"]?([a-zA-Z0-9_.\-/]+)",
-    re.IGNORECASE,
-)
-SESSION_PATTERN = re.compile(r"(?:session(?:_id| id)?|sid)\s*[:=]\s*([a-zA-Z0-9\-_:./]+)", re.IGNORECASE)
-PROJECT_PATTERN = re.compile(
-    r"(?:project|repo|workspace|cwd|working dir(?:ectory)?)\s*[:=]\s*['\"]?([^'\"\n]+)",
-    re.IGNORECASE,
-)
-PID_PATTERN = re.compile(r"(?:pid|process(?:_id)?)\s*[:=]\s*(\d+)", re.IGNORECASE)
+    process_name: str = "-"
+    process_cmd: str = ""
+    started_at: Optional[float] = None
+    last_event_at: Optional[float] = None
+    last_seen_at: float = field(default_factory=time.time)
+    source_file: str = "-"
 
 
 @dataclass
-class AgentSnapshot:
-    session_id: str
-    pid: Optional[int]
-    project: str
-    state: str
-    tool: str
-    started_at: Optional[float]
-    is_running: bool
-
-    @property
-    def runtime(self) -> str:
-        if not self.started_at:
-            return "unknown"
-        elapsed = max(0, int(time.time() - self.started_at))
-        hours, rem = divmod(elapsed, 3600)
-        minutes, seconds = divmod(rem, 60)
-        if hours:
-            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes:02d}:{seconds:02d}"
+class TailState:
+    offset: int = 0
+    signature: Optional[tuple[int, int]] = None
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Monitor active Claude Code agents in a live TUI.")
-    parser.add_argument("--scan-path", action="append", default=[], help="Path to scan for debug logs.")
-    parser.add_argument("--refresh", type=float, default=1.0, help="Refresh interval in seconds.")
-    parser.add_argument("--max-lines", type=int, default=2000, help="Max tail lines to parse per log file.")
-    return parser.parse_args()
+class LogTailer:
+    def __init__(self) -> None:
+        self._states: Dict[Path, TailState] = {}
+
+    def read_new_lines(self, path: Path, max_lines: int) -> List[str]:
+        if not path.exists() or not path.is_file():
+            return []
+
+        try:
+            stat = path.stat()
+        except OSError:
+            return []
+
+        signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        state = self._states.setdefault(path, TailState())
+
+        if state.signature is None:
+            # First read: tail the latest window instead of full file.
+            lines = read_tail_lines(path, max_lines)
+            state.offset = stat.st_size
+            state.signature = signature
+            return lines
+
+        if stat.st_size < state.offset:
+            # File rotated/truncated.
+            state.offset = 0
+
+        lines: List[str] = []
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(state.offset)
+                for raw in handle:
+                    lines.append(raw.rstrip("\n"))
+                state.offset = handle.tell()
+                state.signature = signature
+        except OSError:
+            return []
+
+        if len(lines) > max_lines:
+            return lines[-max_lines:]
+        return lines
 
 
 def default_scan_paths() -> List[Path]:
+    home = Path.home()
     candidates = [
-        Path("/.cladude.debug"),
-        Path("/.claude.debug"),
-        Path.home() / ".cladude.debug",
-        Path.home() / ".claude.debug",
-        Path.home() / ".config" / "claude",
+        Path.cwd(),
+        home / ".codex",
+        home / ".claude",
+        home / ".claude.debug",
+        home / ".cladude.debug",
+        home / ".config" / "claude",
     ]
-    return [p for p in candidates if p.exists()]
+
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "Claude")
+            candidates.append(Path(appdata) / "Codex")
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "Claude")
+            candidates.append(Path(local_appdata) / "Codex")
+
+    unique: List[Path] = []
+    seen = set()
+    for path in candidates:
+        key = str(path)
+        if key not in seen and path.exists():
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
-def gather_log_files(scan_paths: Iterable[Path]) -> List[Path]:
-    logs: List[Path] = []
-    for path in scan_paths:
-        if path.is_file() and path.suffix in {".log", ".jsonl", ".txt"}:
-            logs.append(path)
-        elif path.is_dir():
-            for file in path.rglob("*"):
-                if file.is_file() and file.suffix in {".log", ".jsonl", ".txt"}:
-                    logs.append(file)
-    return sorted(set(logs))
+def discover_log_files(scan_paths: Iterable[Path]) -> List[Path]:
+    files: List[Path] = []
+    for root in scan_paths:
+        if not root.exists():
+            continue
+        if root.is_file():
+            name = root.name.lower()
+            if root.suffix.lower() in LOG_EXTENSIONS or any(h in name for h in LOG_NAME_HINTS):
+                files.append(root)
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            name = path.name.lower()
+            if path.suffix.lower() in LOG_EXTENSIONS and any(h in name for h in LOG_NAME_HINTS):
+                files.append(path)
+    return sorted(set(files))
 
 
-def tail_lines(path: Path, max_lines: int) -> List[str]:
+def read_tail_lines(path: Path, max_lines: int) -> List[str]:
     try:
         data = path.read_bytes()
     except OSError:
         return []
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()
-    return lines[-max_lines:] if len(lines) > max_lines else lines
+    if len(lines) > max_lines:
+        return lines[-max_lines:]
+    return lines
 
 
-def first_match(pattern: re.Pattern[str], lines: Iterable[str], reverse: bool = False) -> Optional[str]:
-    sequence = list(lines)
-    if reverse:
-        sequence.reverse()
-    for line in sequence:
-        match = pattern.search(line)
-        if match:
-            return match.group(1).strip()
+def parse_time_from_line(line: str) -> Optional[float]:
+    iso = ISO_TS_RE.search(line)
+    if iso:
+        raw = iso.group(1)
+        try:
+            return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+
+    unix_match = UNIX_TS_RE.search(line)
+    if unix_match:
+        try:
+            return float(unix_match.group(1))
+        except ValueError:
+            return None
     return None
 
 
-def detect_state(lines: Iterable[str]) -> str:
-    for line in reversed(list(lines)):
-        for pattern, state in STATE_PATTERNS:
-            if pattern.search(line):
-                return state
+def first_match(pattern: re.Pattern[str], text: str) -> Optional[str]:
+    match = pattern.search(text)
+    return match.group(1).strip() if match else None
+
+
+def detect_state(payload_text: str) -> str:
+    for name, pattern in STATE_RULES:
+        if pattern.search(payload_text):
+            return name
     return "unknown"
 
 
-def detect_start_timestamp(lines: Iterable[str]) -> Optional[float]:
-    ts_patterns = [
-        re.compile(r"(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"),
-        re.compile(r"\b(\d{10})\b"),
+def running_processes() -> Dict[int, ProcessInfo]:
+    return _running_processes_windows() if os.name == "nt" else _running_processes_posix()
+
+
+def _running_processes_windows() -> Dict[int, ProcessInfo]:
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Depth 2 -Compress",
     ]
-    for line in lines:
-        for pattern in ts_patterns:
-            match = pattern.search(line)
-            if not match:
-                continue
-            raw = match.group(1)
-            if raw.isdigit() and len(raw) == 10:
-                return float(raw)
-            try:
-                return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                continue
-    return None
-
-
-def running_claude_pids() -> Dict[int, str]:
     try:
-        proc = subprocess.run(["ps", "-eo", "pid=,args="], check=True, text=True, capture_output=True)
+        out = subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.SubprocessError:
         return {}
-    pids: Dict[int, str] = {}
-    for row in proc.stdout.splitlines():
-        row = row.strip()
-        if not row:
+
+    raw = out.stdout.strip()
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    rows = data if isinstance(data, list) else [data]
+    procs: Dict[int, ProcessInfo] = {}
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        pid_part, *rest = row.split(maxsplit=1)
+        pid = row.get("ProcessId")
+        if not isinstance(pid, int):
+            continue
+        name = str(row.get("Name") or "")
+        cmd = str(row.get("CommandLine") or "")
+        blob = f"{name} {cmd}".lower()
+        if "codex" not in blob and "claude" not in blob:
+            continue
+        created_at = None
+        creation = row.get("CreationDate")
+        if isinstance(creation, str) and len(creation) >= 14:
+            # WMI format like 20260302235901.123456+060
+            try:
+                parsed = dt.datetime.strptime(creation[:14], "%Y%m%d%H%M%S")
+                created_at = parsed.timestamp()
+            except ValueError:
+                created_at = None
+
+        procs[pid] = ProcessInfo(pid=pid, name=name or "process", cmd=cmd, created_at=created_at)
+    return procs
+
+
+def _running_processes_posix() -> Dict[int, ProcessInfo]:
+    command = ["ps", "-eo", "pid=,lstart=,args="]
+    try:
+        out = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.SubprocessError:
+        return {}
+
+    procs: Dict[int, ProcessInfo] = {}
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=6)
+        if len(parts) < 7:
+            continue
+        pid_raw = parts[0]
+        lstart = " ".join(parts[1:6])
+        cmd = parts[6]
         try:
-            pid = int(pid_part)
+            pid = int(pid_raw)
         except ValueError:
             continue
-        args = rest[0] if rest else ""
-        if "claude" in args.lower():
-            pids[pid] = args
-    return pids
+        blob = cmd.lower()
+        if "codex" not in blob and "claude" not in blob:
+            continue
+        created_at = None
+        try:
+            created_at = dt.datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            created_at = None
+        procs[pid] = ProcessInfo(pid=pid, name=Path(cmd.split()[0]).name, cmd=cmd, created_at=created_at)
+    return procs
 
 
-def parse_agent_from_log(path: Path, max_lines: int, live_pids: Dict[int, str]) -> Optional[AgentSnapshot]:
-    lines = tail_lines(path, max_lines)
-    if not lines:
+class AgentDashboard:
+    def __init__(self, scan_paths: List[Path], refresh: float, max_lines: int, stale_seconds: int) -> None:
+        self.scan_paths = scan_paths
+        self.refresh = max(refresh, 0.2)
+        self.max_lines = max_lines
+        self.stale_seconds = stale_seconds
+        self.tailer = LogTailer()
+        self.sessions: Dict[str, AgentSession] = {}
+        self.log_files: List[Path] = []
+
+    def refresh_once(self) -> None:
+        self.log_files = discover_log_files(self.scan_paths)
+
+        for log_file in self.log_files:
+            lines = self.tailer.read_new_lines(log_file, self.max_lines)
+            if not lines:
+                continue
+            for line in lines:
+                self._ingest_line(line, log_file)
+
+        procs = running_processes()
+        self._correlate_processes(procs)
+        self._compute_statuses()
+        self._prune_stale()
+
+    def _ingest_line(self, line: str, source: Path) -> None:
+        if not line.strip():
+            return
+
+        payload_text = line
+        if line.lstrip().startswith("{") and line.rstrip().endswith("}"):
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    payload_text = " ".join(f"{k}:{v}" for k, v in obj.items())
+            except json.JSONDecodeError:
+                pass
+
+        session_id = first_match(SESSION_RE, payload_text)
+        if not session_id:
+            return
+
+        session = self.sessions.setdefault(session_id, AgentSession(session_id=session_id))
+        now = time.time()
+        session.last_seen_at = now
+        session.source_file = str(source)
+
+        project = first_match(PROJECT_RE, payload_text)
+        if project:
+            session.project = project
+
+        tool = first_match(TOOL_RE, payload_text)
+        if tool:
+            session.tool = tool
+
+        pid_txt = first_match(PID_RE, payload_text)
+        if pid_txt and pid_txt.isdigit():
+            session.pid = int(pid_txt)
+
+        parsed_ts = parse_time_from_line(line)
+        if parsed_ts:
+            session.last_event_at = parsed_ts
+            if session.started_at is None:
+                session.started_at = parsed_ts
+        else:
+            session.last_event_at = now if session.last_event_at is None else session.last_event_at
+            if session.started_at is None:
+                session.started_at = now
+
+        state = detect_state(payload_text)
+        if state != "unknown":
+            session.state = state
+
+    def _correlate_processes(self, procs: Dict[int, ProcessInfo]) -> None:
+        for session in self.sessions.values():
+            if session.pid and session.pid in procs:
+                proc = procs[session.pid]
+                session.process_name = proc.name
+                session.process_cmd = proc.cmd
+                if proc.created_at:
+                    session.started_at = proc.created_at
+                continue
+
+            chosen = self._pick_process(session, procs)
+            if chosen:
+                session.pid = chosen.pid
+                session.process_name = chosen.name
+                session.process_cmd = chosen.cmd
+                if chosen.created_at:
+                    session.started_at = chosen.created_at
+
+    @staticmethod
+    def _pick_process(session: AgentSession, procs: Dict[int, ProcessInfo]) -> Optional[ProcessInfo]:
+        sid = session.session_id.lower()
+        project = session.project.lower()
+
+        for proc in procs.values():
+            cmd = proc.cmd.lower()
+            if sid and sid in cmd:
+                return proc
+
+        if project and project != "-":
+            for proc in procs.values():
+                if project in proc.cmd.lower():
+                    return proc
+
         return None
 
-    session_id = first_match(SESSION_PATTERN, lines, reverse=True) or path.stem
-    pid_text = first_match(PID_PATTERN, lines, reverse=True)
-    pid = int(pid_text) if pid_text and pid_text.isdigit() else None
+    def _compute_statuses(self) -> None:
+        now = time.time()
+        process_pids = {s.pid for s in self.sessions.values() if s.pid}
 
-    project = first_match(PROJECT_PATTERN, lines, reverse=True)
-    if not project and pid and pid in live_pids:
-        cmd = live_pids[pid]
-        match = re.search(r"(?:--cwd|--project)\s+([^\s]+)", cmd)
-        project = match.group(1) if match else "unknown"
-    project = project or "unknown"
+        for session in self.sessions.values():
+            running = bool(session.pid and session.pid in process_pids)
+            age = now - (session.last_event_at or session.last_seen_at)
 
-    state = detect_state(lines)
-    tool = first_match(TOOL_PATTERN, lines, reverse=True) or "-"
-    started_at = detect_start_timestamp(lines)
+            if running and age <= 30:
+                session.status = "active"
+            elif running and session.state == "idle":
+                session.status = "running-idle"
+            elif running:
+                session.status = "running"
+            elif age <= 60:
+                session.status = "recent-log"
+            else:
+                session.status = "stale"
 
-    is_running = bool(pid and pid in live_pids)
-    if not pid:
-        stem_digits = re.search(r"(\d{3,})", path.stem)
-        if stem_digits:
-            possible_pid = int(stem_digits.group(1))
-            if possible_pid in live_pids:
-                pid = possible_pid
-                is_running = True
+    def _prune_stale(self) -> None:
+        now = time.time()
+        dead = [
+            sid
+            for sid, sess in self.sessions.items()
+            if sess.status == "stale" and (now - sess.last_seen_at) > self.stale_seconds
+        ]
+        for sid in dead:
+            del self.sessions[sid]
 
-    return AgentSnapshot(session_id, pid, project, state, tool, started_at, is_running)
+    def snapshots(self) -> List[AgentSession]:
+        def sort_key(sess: AgentSession) -> tuple[int, str]:
+            priority = {
+                "active": 0,
+                "running": 1,
+                "running-idle": 2,
+                "recent-log": 3,
+                "stale": 4,
+                "unknown": 5,
+            }.get(sess.status, 9)
+            return (priority, sess.session_id)
+
+        return sorted(self.sessions.values(), key=sort_key)
 
 
-def collect_agents(scan_paths: List[Path], max_lines: int) -> List[AgentSnapshot]:
-    live_pids = running_claude_pids()
-    snapshots: Dict[str, AgentSnapshot] = {}
-    for log in gather_log_files(scan_paths):
-        snap = parse_agent_from_log(log, max_lines, live_pids)
-        if snap and (snap.is_running or snap.state != "unknown"):
-            snapshots[snap.session_id] = snap
-    return sorted(snapshots.values(), key=lambda s: (not s.is_running, s.session_id))
+def format_age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    value = max(0, int(seconds))
+    h, rem = divmod(value, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
-def fit(value: str, width: int) -> str:
-    if width <= 1:
+def clip(value: str, width: int) -> str:
+    if width <= 0:
         return ""
     if len(value) <= width:
         return value
     if width <= 3:
         return value[:width]
-    return value[: width - 1] + "…"
+    return value[: width - 3] + "..."
 
 
-def draw_dashboard(stdscr: "curses._CursesWindow", scan_paths: List[Path], refresh: float, max_lines: int) -> None:
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-
-    headers = ["Session ID", "PID", "Project", "State", "Tool", "Runtime", "Status"]
-
-    while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-
-        snapshots = collect_agents(scan_paths, max_lines)
-
-        stdscr.addstr(0, 0, fit("Claude Code Agents Monitor (q to quit)", w - 1))
-        stdscr.addstr(1, 0, fit(f"Scanning: {', '.join(str(p) for p in scan_paths)}", w - 1))
-
-        widths = [24, 7, 24, 18, 18, 10, 10]
-        total = sum(widths) + len(widths) - 1
-        if total > w - 1:
-            scale = (w - 1 - (len(widths) - 1)) / max(sum(widths), 1)
-            widths = [max(4, int(col * scale)) for col in widths]
-
-        y = 3
-        x = 0
-        for idx, head in enumerate(headers):
-            stdscr.addstr(y, x, fit(head, widths[idx]))
-            x += widths[idx] + 1
-
-        y += 1
-        stdscr.hline(y, 0, ord("-"), min(w - 1, sum(widths) + len(widths) - 1))
-        y += 1
-
-        if not snapshots:
-            stdscr.addstr(y, 0, fit("No agents detected", w - 1))
-        else:
-            for snap in snapshots:
-                if y >= h - 1:
-                    break
-                row = [
-                    snap.session_id,
-                    str(snap.pid or "-"),
-                    snap.project,
-                    snap.state,
-                    snap.tool,
-                    snap.runtime,
-                    "running" if snap.is_running else "log-only",
-                ]
-                x = 0
-                for idx, col in enumerate(row):
-                    stdscr.addstr(y, x, fit(col, widths[idx]))
-                    x += widths[idx] + 1
-                y += 1
-
-        stdscr.refresh()
-
-        for _ in range(max(1, int(refresh * 10))):
-            key = stdscr.getch()
-            if key in (ord("q"), ord("Q")):
-                return
-            time.sleep(0.1)
+def clear_screen() -> None:
+    # ANSI clear + home. Works in modern Windows terminals and POSIX terminals.
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.flush()
 
 
+def render_dashboard(dashboard: AgentDashboard) -> str:
+    rows = dashboard.snapshots()
+    now = time.time()
+
+    active = sum(1 for s in rows if s.status == "active")
+    running = sum(1 for s in rows if s.status in {"active", "running", "running-idle"})
+    thinking = sum(1 for s in rows if s.state == "thinking")
+    typing = sum(1 for s in rows if s.state == "typing")
+    idle = sum(1 for s in rows if s.state == "idle")
+
+    lines: List[str] = []
+    lines.append("Codex / Claude Activity Dashboard")
+    lines.append(
+        f"time={dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | sessions={len(rows)} | "
+        f"active={active} | running={running} | thinking={thinking} | typing={typing} | idle={idle}"
+    )
+    lines.append(f"scan_paths={', '.join(str(p) for p in dashboard.scan_paths)}")
+    lines.append(f"log_files={len(dashboard.log_files)} | refresh={dashboard.refresh:.1f}s | max_lines={dashboard.max_lines}")
+    lines.append("")
+
+    headers = ["Session", "Process", "State", "Status", "Tool", "Runtime", "LastEvt", "Project"]
+    widths = [18, 14, 10, 13, 18, 9, 9, 30]
+
+    head = " ".join(clip(h, widths[i]).ljust(widths[i]) for i, h in enumerate(headers))
+    lines.append(head)
+    lines.append("-" * len(head))
+
+    if not rows:
+        lines.append("No agent sessions detected yet. Keep the dashboard running while Codex is active.")
+        return "\n".join(lines)
+
+    for sess in rows:
+        process = f"{sess.process_name}:{sess.pid}" if sess.pid else "-"
+        runtime = format_age(now - sess.started_at if sess.started_at else None)
+        last_evt = format_age(now - sess.last_event_at if sess.last_event_at else None)
+
+        cols = [
+            sess.session_id,
+            process,
+            sess.state,
+            sess.status,
+            sess.tool,
+            runtime,
+            last_evt,
+            sess.project,
+        ]
+
+        row = " ".join(clip(str(col), widths[i]).ljust(widths[i]) for i, col in enumerate(cols))
+        lines.append(row)
+
+    return "\n".join(lines)
 
 
-def print_snapshot(scan_paths: List[Path], max_lines: int) -> None:
-    snapshots = collect_agents(scan_paths, max_lines)
-    print("Claude Code Agents Monitor")
-    print(f"Scanning: {', '.join(str(p) for p in scan_paths)}")
-    if not snapshots:
-        print("No agents detected")
-        return
-    for snap in snapshots:
-        print(
-            f"{snap.session_id} | pid={snap.pid or '-'} | project={snap.project} | "
-            f"state={snap.state} | tool={snap.tool} | runtime={snap.runtime} | "
-            f"status={'running' if snap.is_running else 'log-only'}"
-        )
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Detailed live dashboard for Codex/Claude agent activity.")
+    parser.add_argument("--scan-path", action="append", default=[], help="Path to scan for log files. Can be repeated.")
+    parser.add_argument("--refresh", type=float, default=1.0, help="Refresh interval in seconds.")
+    parser.add_argument("--max-lines", type=int, default=2000, help="Max lines to ingest per log update.")
+    parser.add_argument("--stale-seconds", type=int, default=1800, help="Seconds before stale sessions are pruned.")
+    parser.add_argument("--once", action="store_true", help="Render one snapshot and exit.")
+    return parser.parse_args()
+
 
 def main() -> int:
     args = parse_args()
     scan_paths = [Path(p).expanduser() for p in args.scan_path] if args.scan_path else default_scan_paths()
     if not scan_paths:
-        print("No debug paths found. Use --scan-path to provide log directories.")
+        print("No scan paths found. Provide at least one with --scan-path.")
         return 1
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print_snapshot(scan_paths, args.max_lines)
+
+    dashboard = AgentDashboard(
+        scan_paths=scan_paths,
+        refresh=args.refresh,
+        max_lines=max(200, args.max_lines),
+        stale_seconds=max(60, args.stale_seconds),
+    )
+
+    if args.once:
+        dashboard.refresh_once()
+        print(render_dashboard(dashboard))
         return 0
-    curses.wrapper(draw_dashboard, scan_paths, max(args.refresh, 0.2), args.max_lines)
-    return 0
+
+    try:
+        while True:
+            dashboard.refresh_once()
+            clear_screen()
+            print(render_dashboard(dashboard))
+            time.sleep(dashboard.refresh)
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-<<<<<<< ours
->>>>>>> theirs
-=======
->>>>>>> theirs
